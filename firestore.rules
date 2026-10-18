@@ -1,0 +1,32 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+
+    // SOPs: any signed-in teammate can read; the creator can create a new one.
+    // All processing updates are written by the Cloud Run backend (Admin SDK bypasses rules).
+    match /sops/{sopId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.status == 'uploaded'
+        && request.resource.data.keys().hasOnly([
+             'ownerUid', 'ownerName', 'title', 'context', 'status', 'statusMessage',
+             'sourceType', 'videoPath', 'videoMime', 'notes', 'createdAt', 'updatedAt'])
+        && (request.resource.data.sourceType != 'video'
+            || request.resource.data.videoPath.matches('uploads/' + request.auth.uid + '/.*'));
+      allow update, delete: if false;
+
+      match /qa/{qaId} {
+        allow read: if signedIn();
+        allow write: if false;
+      }
+    }
+
+    // Each person's own training progress.
+    match /users/{uid}/progress/{sopId} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+  }
+}
