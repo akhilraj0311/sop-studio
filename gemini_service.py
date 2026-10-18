@@ -29,7 +29,7 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 # First model that works is used (and remembered); later ones are fallbacks if a name
 # isn't available in the project/region or has been retired.
 MODELS = [m.strip() for m in os.getenv(
-    "GEMINI_MODELS", "gemini-3.5-flash,gemini-flash-latest,gemini-2.5-flash").split(",") if m.strip()]
+    "GEMINI_MODELS", "gemini-flash-latest,gemini-3.8-flash").split(",") if m.strip()]
 
 INLINE_LIMIT = 18 * 1024 * 1024  # inline video bytes limit (request max is ~20MB)
 

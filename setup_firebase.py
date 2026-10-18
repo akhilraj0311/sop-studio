@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Automates the Firebase console steps for SOP Studio (called by deploy.sh).
 
-  python3 setup_firebase.py init   PROJECT_ID BUCKET   → Firebase project, web app, Storage link,
+  python3 setup_firebase.py init   PROJECT_ID BUCKET|-  → Firebase project, web app, Storage link,
                                                         security rules, Auth (+ guest sign-in), writes .env
   python3 setup_firebase.py domain PROJECT_ID HOST     → adds the Cloud Run host to Auth authorized domains
 
@@ -234,15 +234,16 @@ def cmd_init(bucket: str) -> int:
     if not add_firebase():
         return 2
     cfg = web_app_config()
-    link_bucket(bucket)
     release_rules("cloud.firestore", "firestore.rules")
-    release_rules(f"firebase.storage/{bucket}", "storage.rules")
+    if bucket != "-":  # "-" = free Spark plan: no Cloud Storage bucket
+        link_bucket(bucket)
+        release_rules(f"firebase.storage/{bucket}", "storage.rules")
     setup_auth()
     if cfg:
         write_env({
             "FIREBASE_API_KEY": cfg.get("apiKey", ""),
             "FIREBASE_AUTH_DOMAIN": cfg.get("authDomain") or f"{PROJECT}.firebaseapp.com",
-            "FIREBASE_STORAGE_BUCKET": bucket,
+            "FIREBASE_STORAGE_BUCKET": bucket if bucket != "-" else "",
             "FIREBASE_MESSAGING_SENDER_ID": cfg.get("messagingSenderId", ""),
             "FIREBASE_APP_ID": cfg.get("appId", ""),
         })

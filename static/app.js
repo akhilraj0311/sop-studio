@@ -1,24 +1,85 @@
 // SOP Studio — single-page app (no build step).
-// Firebase Auth + Firestore (real-time) + Cloud Storage for Firebase in the browser,
-// FastAPI on Cloud Run for the Gemini pipeline.
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+// Firebase Auth + Firestore (real-time) + Gemini via Firebase AI Logic, all from the browser.
+// Runs on Firebase Hosting (free Spark plan). The optional Cloud Run backend (main.py) serves the same app.
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.12.0/firebase-app.js";
 import {
   getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signInAnonymously, signOut,
-} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+} from "https://www.gstatic.com/firebasejs/12.12.0/firebase-auth.js";
 import {
-  getFirestore, collection, doc, setDoc, getDoc, onSnapshot, query, orderBy, limit, serverTimestamp,
-} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import {
-  getStorage, ref as sref, uploadBytesResumable, getDownloadURL,
-} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
+  getFirestore, collection, doc, setDoc, getDoc, getDocs, updateDoc, addDoc, deleteDoc,
+  onSnapshot, query, orderBy, limit, serverTimestamp,
+} from "https://www.gstatic.com/firebasejs/12.12.0/firebase-firestore.js";
+import { initAI, analyzeNotes, analyzeVideo, buildTraining, answerQuestion, blobToBase64 } from "./ai.js";
+import { DEMO_SOPS } from "./demo.js";
 
 // ------------------------------------------------------------------ boot
 const $app = document.getElementById("app");
-const cfg = await fetch("/api/config").then((r) => r.json());
+const cfg = window.SOP_CONFIG || await fetch("/api/config").then((r) => r.json());
 const fbApp = initializeApp(cfg);
 const auth = getAuth(fbApp);
 const db = getFirestore(fbApp);
-const storage = getStorage(fbApp);
+initAI(fbApp);
+const MAX_VIDEO_BYTES = 14 * 1024 * 1024; // sent inline to Gemini (request limit ~20 MB after base64)
+
+// Recordings stay on the recorder's device (IndexedDB) for step playback; only the SOP goes to Firestore.
+const videoStore = {
+  _db: null,
+  async open() {
+    if (this._db) return this._db;
+    this._db = await new Promise((res, rej) => {
+      const r = indexedDB.open("sop-studio", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("videos");
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+    return this._db;
+  },
+  async put(id, blob) { try { const d = await this.open(); await new Promise((res, rej) => { const t = d.transaction("videos", "readwrite"); t.objectStore("videos").put(blob, id); t.oncomplete = res; t.onerror = () => rej(t.error); }); } catch (e) { console.warn("video save failed", e); } },
+  async get(id) { try { const d = await this.open(); return await new Promise((res) => { const r = d.transaction("videos").objectStore("videos").get(id); r.onsuccess = () => res(r.result || null); r.onerror = () => res(null); }); } catch { return null; } },
+  async del(id) { try { const d = await this.open(); d.transaction("videos", "readwrite").objectStore("videos").delete(id); } catch {} },
+};
+
+// The Gemini pipeline: source → SOP → training, streaming status through Firestore.
+const running = new Set();
+async function runPipeline(id, data, blob = null) {
+  if (running.has(id)) return;
+  running.add(id);
+  const ref = doc(db, "sops", id);
+  const status = (status, statusMessage, extra = {}) => updateDoc(ref, { status, statusMessage, updatedAt: serverTimestamp(), ...extra });
+  try {
+    let result;
+    if (data.sourceType === "notes") {
+      await status("analyzing", "Gemini is reading your notes…");
+      result = await analyzeNotes(data.notes, data.context);
+    } else {
+      blob = blob || await videoStore.get(id);
+      if (!blob) throw new Error("The recording is only stored on the device that made it. Open this SOP there to retry.");
+      await status("analyzing", "Gemini is watching your recording…");
+      result = await analyzeVideo(await blobToBase64(blob), (data.videoMime || blob.type || "video/webm").split(";")[0], data.context);
+    }
+    const { sop, model } = result;
+    await status("training", "Writing the checklist and quiz…", { sop, title: sop.title, category: sop.category, model });
+    const training = await buildTraining(sop);
+    await status("ready", "Ready", { training });
+  } catch (e) {
+    console.error(e);
+    await status("error", String(e.message || e).slice(0, 300)).catch(() => {});
+  } finally { running.delete(id); }
+}
+
+async function seedDemo(btn) {
+  btn.disabled = true;
+  for (const [i, d] of DEMO_SOPS.entries()) {
+    btn.textContent = `Creating demo ${i + 1} of ${DEMO_SOPS.length}…`;
+    const id = `${d.id}-${user.uid.slice(0, 6)}`;
+    const data = {
+      ownerUid: user.uid, ownerName: d.owner, title: d.title, context: d.context, sourceType: "notes", notes: d.notes,
+      status: "uploaded", statusMessage: "Queued", createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
+    };
+    await setDoc(doc(db, "sops", id), data);
+    await runPipeline(id, data);
+  }
+  btn.textContent = "Demo SOPs ready";
+}
 
 let user = null;
 let unsubs = [];
@@ -71,19 +132,6 @@ function toast(msg, kind = "") {
   t.textContent = msg; t.className = `toast ${kind}`; t.hidden = false;
   clearTimeout(toast._t); toast._t = setTimeout(() => (t.hidden = true), 4000);
 }
-async function api(path, opts = {}) {
-  const token = await auth.currentUser.getIdToken();
-  const res = await fetch(path, {
-    ...opts,
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...(opts.headers || {}) },
-  });
-  if (!res.ok) {
-    let detail = res.statusText;
-    try { detail = (await res.json()).detail || detail; } catch {}
-    throw new Error(detail);
-  }
-  return res.json();
-}
 const newId = () => doc(collection(db, "sops")).id;
 
 // ------------------------------------------------------------------ landing
@@ -91,7 +139,7 @@ function renderLanding() {
   $app.innerHTML = `
   <section class="hero">
     <div class="hero-copy">
-      <p class="eyebrow">Gemini · Firebase · Cloud Run</p>
+      <p class="eyebrow">Gemini · Firebase · Firestore</p>
       <h1>Record a task once.<br/><em>Onboard everyone forever.</em></h1>
       <p class="lede">Record your screen while you do a work task. SOP Studio's Gemini pipeline watches it and writes a step-by-step SOP with clickable video moments. It also builds a new-hire checklist and quiz, and points out where the process could be automated.</p>
       <div class="hero-cta">
@@ -139,7 +187,10 @@ function renderLibrary() {
     const list = all.filter((s) => !q || JSON.stringify([s.title, s.category, s.sop?.tools, s.sop?.summary]).toLowerCase().includes(q));
     const grid = document.getElementById("grid");
     if (!all.length) {
-      grid.innerHTML = `<div class="empty"><h3>No SOPs yet</h3><p>Record your first process. It takes under 3 minutes.</p><a class="btn btn-primary" href="#/new">Record a process</a></div>`;
+      grid.innerHTML = `<div class="empty"><h3>No SOPs yet</h3><p>Record your first process. It takes under 3 minutes.</p>
+        <div class="row" style="justify-content:center"><a class="btn btn-primary" href="#/new">Record a process</a>
+        <button class="btn btn-ghost" id="seedBtn">Load 3 demo SOPs</button></div></div>`;
+      document.getElementById("seedBtn").onclick = (e) => seedDemo(e.currentTarget).catch((err) => toast(err.message, "err"));
       return;
     }
     grid.innerHTML = list.map(cardHtml).join("") || `<p class="muted">No matches.</p>`;
@@ -207,7 +258,7 @@ function renderNew() {
     </div>
     <div class="panel" id="panel-upload" hidden>
       <label class="drop" id="drop"><input type="file" id="fileInput" accept="video/*" hidden />
-        <strong>Drop a screen recording here</strong><span class="muted">or click to choose · MP4, WebM or MOV · up to 3 min / 150 MB</span>
+        <strong>Drop a screen recording here</strong><span class="muted">or click to choose · MP4, WebM or MOV · up to ~2 min / 14 MB</span>
         <span id="fileName" class="file-name"></span></label>
     </div>
     <div class="panel" id="panel-notes" hidden>
@@ -244,7 +295,7 @@ function renderNew() {
   const takeFile = (f) => {
     if (!f) return;
     if (!f.type.startsWith("video/")) return toast("Please choose a video file", "err");
-    if (f.size > 150 * 1024 * 1024) return toast("That file is over 150 MB. Please trim it to under 3 minutes.", "err");
+    if (f.size > MAX_VIDEO_BYTES) return toast("That file is over 14 MB. Please trim it to about 2 minutes or record with the Record tab.", "err");
     blob = f; blobMime = f.type; document.getElementById("fileName").textContent = `✓ ${f.name} (${(f.size / 1048576).toFixed(1)} MB)`; refreshBtn();
   };
   fileInput.onchange = () => takeFile(fileInput.files[0]);
@@ -275,7 +326,7 @@ function renderNew() {
       }
       const combined = new MediaStream([...tracks, ...audioTracks]);
       const mime = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm", "video/mp4"].find((m) => MediaRecorder.isTypeSupported(m)) || "";
-      recorder = new MediaRecorder(combined, { mimeType: mime || undefined, videoBitsPerSecond: 900_000 });
+      recorder = new MediaRecorder(combined, { mimeType: mime || undefined, videoBitsPerSecond: 450_000, audioBitsPerSecond: 48_000 });
       chunks = [];
       recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
       recorder.onstop = () => {
@@ -322,17 +373,13 @@ function renderNew() {
       if (mode === "notes") {
         await setDoc(doc(db, "sops", id), { ...base, sourceType: "notes", notes: document.getElementById("notes").value.trim().slice(0, 20000) });
       } else {
-        const ext = blobMime.includes("mp4") ? "mp4" : blobMime.includes("quicktime") ? "mov" : "webm";
-        const path = `uploads/${user.uid}/${id}.${ext}`;
-        const bar = document.getElementById("uploadProgress"); bar.hidden = false;
-        await new Promise((resolve, reject) => {
-          const task = uploadBytesResumable(sref(storage, path), blob, { contentType: blobMime || "video/webm" });
-          task.on("state_changed", (s) => (bar.firstElementChild.style.width = `${(s.bytesTransferred / s.totalBytes) * 100}%`), reject, resolve);
-        });
-        await setDoc(doc(db, "sops", id), { ...base, sourceType: "video", videoPath: path, videoMime: blobMime || "video/webm" });
+        if (blob.size > MAX_VIDEO_BYTES) throw new Error("Recording is over 14 MB. Please keep it to about 2 minutes.");
+        await videoStore.put(id, blob);
+        await setDoc(doc(db, "sops", id), { ...base, sourceType: "video", videoMime: blobMime || "video/webm", videoBytes: blob.size });
       }
+      const created = (await getDoc(doc(db, "sops", id))).data();
       location.hash = `#/sop/${id}`;
-      api(`/api/sops/${id}/process`, { method: "POST" }).catch((e) => toast(`Processing failed: ${e.message}`, "err"));
+      runPipeline(id, created, mode === "notes" ? null : blob);
     } catch (e) {
       toast(`Upload failed: ${e.message}`, "err");
       genBtn.disabled = false; genBtn.textContent = "Generate SOP with Gemini ✨";
@@ -369,12 +416,13 @@ function renderPipeline(s) {
   const order = ["uploaded", "analyzing", "training", "ready"];
   const idx = order.indexOf(s.status);
   const stages = [
-    ["uploaded", s.sourceType === "notes" ? "Notes saved" : "Video uploaded to Cloud Storage"],
+    ["uploaded", s.sourceType === "notes" ? "Notes saved to Firestore" : "Recording ready (kept on this device)"],
     ["analyzing", s.sourceType === "notes" ? "Gemini is reading your notes" : "Gemini is watching the recording"],
     ["training", "Building the checklist and quiz"],
     ["ready", "SOP ready"],
   ];
-  const isErr = s.status === "error";
+  const stale = ["analyzing", "training"].includes(s.status) && !running.has(s.id) && s.updatedAt?.toDate && Date.now() - s.updatedAt.toDate().getTime() > 120000;
+  const isErr = s.status === "error" || stale;
   $app.innerHTML = `
   <section class="pipeline">
     <h1>${esc(s.title || "Untitled SOP")}</h1>
@@ -383,19 +431,19 @@ function renderPipeline(s) {
       ${stages.map(([k, label], i) => `<li class="${isErr ? (i === 0 ? "done" : "") : i < idx ? "done" : i === idx ? "active" : ""}">
         <span class="dot">${i < idx ? "✓" : i + 1}</span><span>${label}</span></li>`).join("")}
     </ol>
-    ${isErr ? `<div class="error-box">${esc(s.statusMessage)}<div class="row">
+    ${isErr ? `<div class="error-box">${esc(stale ? "Processing was interrupted (the page was closed or refreshed)." : s.statusMessage)}<div class="row">
       ${s.ownerUid === user.uid ? `<button class="btn btn-primary" id="retryBtn">Try again</button>` : ""}<a class="btn btn-ghost" href="#/library">Back to library</a></div></div>`
       : `<p class="muted small">This usually takes 20–60 seconds. Updates appear here live through Firestore.</p>`}
   </section>`;
   const retry = document.getElementById("retryBtn");
-  if (retry) retry.onclick = () => { retry.disabled = true; api(`/api/sops/${s.id}/process`, { method: "POST" }).catch((e) => toast(e.message, "err")); };
+  if (retry) retry.onclick = () => { retry.disabled = true; runPipeline(s.id, s); };
   // If this user created it and it's still queued (e.g. page refresh mid-flow), make sure processing starts.
-  if (s.status === "uploaded" && s.ownerUid === user.uid && !renderPipeline._kicked?.[s.id]) {
+  if (s.status === "uploaded" && s.ownerUid === user.uid && !running.has(s.id) && !renderPipeline._kicked?.[s.id]) {
     renderPipeline._kicked = { ...(renderPipeline._kicked || {}), [s.id]: true };
     setTimeout(async () => {
       const fresh = await getDoc(doc(db, "sops", s.id)).catch(() => null);
-      if (fresh?.data()?.status === "uploaded") api(`/api/sops/${s.id}/process`, { method: "POST" }).catch(() => {});
-    }, 8000);
+      if (fresh?.data()?.status === "uploaded" && !running.has(s.id)) runPipeline(s.id, fresh.data());
+    }, 4000);
   }
 }
 
@@ -403,7 +451,7 @@ async function renderReady(s) {
   const sop = s.sop || {};
   const ins = sop.insights || {};
   let videoUrl = null;
-  if (s.videoPath) { try { videoUrl = await getDownloadURL(sref(storage, s.videoPath)); } catch {} }
+  if (s.sourceType === "video") { const b = await videoStore.get(s.id); if (b) { videoUrl = URL.createObjectURL(b); cleanupFns.push(() => URL.revokeObjectURL(videoUrl)); } }
   const saved = (ins.automation_ideas || []).reduce((a, i) => a + (Number(i.estimated_minutes_saved) || 0), 0);
 
   $app.innerHTML = `
@@ -437,6 +485,7 @@ async function renderReady(s) {
         ${videoUrl ? `<div class="video-col"><div class="sticky"><video id="sopVideo" src="${esc(videoUrl)}" controls playsinline preload="metadata"></video>
           <p class="muted small">Press ▶ on any step to play just that moment.</p></div></div>` : ""}
         <div class="steps-col">
+          ${s.sourceType === "video" && !videoUrl ? `<p class="note tip">🎥 Made from a screen recording. The video stays on the recorder's device, so step playback is available there.</p>` : ""}
           ${(sop.prerequisites || []).length || (sop.tools || []).length ? `<div class="prereq">
             ${(sop.tools || []).length ? `<div><h4>Tools</h4><div class="chips">${sop.tools.map((t) => `<span class="chip">${esc(t)}</span>`).join("")}</div></div>` : ""}
             ${(sop.prerequisites || []).length ? `<div><h4>Before you start</h4><ul>${sop.prerequisites.map((p) => `<li>${esc(p)}</li>`).join("")}</ul></div>` : ""}
@@ -530,7 +579,11 @@ async function renderReady(s) {
   const del = document.getElementById("deleteBtn");
   if (del) del.onclick = async () => {
     if (!confirm("Delete this SOP for everyone?")) return;
-    try { await api(`/api/sops/${s.id}`, { method: "DELETE" }); location.hash = "#/library"; } catch (e) { toast(e.message, "err"); }
+    try {
+      const qa = await getDocs(collection(db, "sops", s.id, "qa"));
+      await Promise.all(qa.docs.map((d) => deleteDoc(d.ref)));
+      await deleteDoc(doc(db, "sops", s.id)); await videoStore.del(s.id); location.hash = "#/library";
+    } catch (e) { toast(e.message, "err"); }
   };
 
   // training
@@ -550,7 +603,11 @@ async function renderReady(s) {
     askBtn.disabled = true; askBtn.textContent = "Thinking…"; input.value = "";
     qaList.insertAdjacentHTML("beforeend", `<div class="qa pending"><div class="q">${esc(q)}</div><div class="a"><span class="typing"><i></i><i></i><i></i></span></div></div>`);
     qaList.scrollTop = qaList.scrollHeight;
-    try { await api(`/api/sops/${s.id}/ask`, { method: "POST", body: JSON.stringify({ question: q }) }); }
+    try {
+      const hist = (await getDocs(query(collection(db, "sops", s.id, "qa"), orderBy("createdAt", "desc"), limit(4)))).docs.map((d) => d.data()).reverse();
+      const a = await answerQuestion(s.sop, q.trim().slice(0, 600), hist);
+      await addDoc(collection(db, "sops", s.id, "qa"), { question: q.trim().slice(0, 600), ...a, askedBy: displayName(user), askedByUid: user.uid, createdAt: serverTimestamp() });
+    }
     catch (e) { toast(`Couldn't answer: ${e.message}`, "err"); qaList.querySelector(".qa.pending")?.remove(); }
     finally { askBtn.disabled = false; askBtn.textContent = "Ask"; }
   };

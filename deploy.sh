@@ -17,7 +17,7 @@ REGION="${REGION:-asia-south1}"
 SERVICE="${SERVICE:-sop-studio}"
 BUCKET="${FIREBASE_STORAGE_BUCKET:-${PROJECT_ID}-sop-videos}"
 GEMINI_LOCATION="${GEMINI_LOCATION:-global}"
-GEMINI_MODELS="${GEMINI_MODELS:-gemini-3.5-flash,gemini-flash-latest,gemini-2.5-flash}"
+GEMINI_MODELS="${GEMINI_MODELS:-gemini-flash-latest,gemini-3.8-flash}"
 SEED_KEY="${SEED_KEY:-$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')}"
 
 step() { echo; echo "━━ $* ━━"; }

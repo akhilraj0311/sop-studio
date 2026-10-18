@@ -17,34 +17,31 @@ No recording? You can **paste rough notes** or a messy Slack thread instead, and
 ## Architecture
 
 ```
-Browser (vanilla JS SPA)
+Browser (vanilla JS SPA, served by Firebase Hosting)
   ├─ Firebase Auth ───────────── Google sign-in + anonymous guest mode
-  ├─ Cloud Storage for Firebase ─ screen recordings (uploads/{uid}/…)
   ├─ Firestore (real-time) ──── SOPs, live pipeline status, Q&A, training progress
-  └─ fetch /api/* ──────────────┐
-                                ▼
-                Cloud Run: FastAPI container
-                  ├─ verifies Firebase ID tokens (Admin SDK)
-                  ├─ Gemini on Vertex AI
-                  │    1. video (gs://) → structured SOP JSON + insights
-                  │    2. SOP → checklist + quiz
-                  │    3. SOP + question → grounded answer
-                  └─ writes results to Firestore → UI updates live
+  ├─ Firebase AI Logic → Gemini  video/notes → SOP, training, grounded Q&A
+  └─ IndexedDB ───────────────── recordings stay on the recorder's device (step playback)
+
+Optional production backend (needs a billing account): Cloud Run (FastAPI, main.py)
+  └─ same app + server-side Gemini on Vertex AI, recordings in Cloud Storage
 ```
 
 | Google technology | How it's used |
 |---|---|
-| **Gemini** | Multimodal video understanding of screen recordings (clicks, screens, narration) → SOP with timestamps; training generation; grounded Q&A; process-efficiency analysis. JSON-mode outputs with model fallback. |
-| **Cloud Run** | Hosts the whole app (API + web UI) in one container. `min-instances=1`, 10-min request timeout for long videos, autoscaling to 5 instances. |
-| **Firestore** | System of record for SOPs, Q&A history and per-user training progress. Real-time listeners stream pipeline status (Uploaded → Watching → Writing → Ready) to the browser. Security rules lock writes to the backend. |
-| **Firebase** | Authentication (Google + anonymous), Cloud Storage for recordings, and security rules for Firestore and Storage. |
+| **Gemini** | Multimodal understanding of screen recordings (clicks, screens, narration) → SOP with per-step timestamps; new-hire checklist and quiz; Q&A grounded only in the SOP; process-efficiency analysis. JSON outputs with automatic model fallback. Called through **Firebase AI Logic** (Gemini Developer API). |
+| **Firestore** | System of record for SOPs, Q&A history and per-user training progress. Real-time listeners stream the pipeline status (Saved → Gemini watching → Writing training → Ready) to every open browser. Security rules: creators own their SOPs, teammates can read and ask. |
+| **Firebase** | Hosting (live app at `*.web.app`), Authentication (Google + anonymous guest mode), AI Logic (Gemini access without exposing keys), security rules. |
+| **Cloud Run** | Production backend in this repo (`main.py`, `Dockerfile`, `deploy.sh`): server-side Gemini on Vertex AI, Cloud Storage for recordings, `min-instances=1`. Deployable with one command once billing is enabled. The live demo runs on the free Firebase tier. |
 
 ## Tech stack
 Python 3.12 · FastAPI · google-genai SDK · firebase-admin · Firebase JS SDK v10 · MediaRecorder / Screen Capture API · Docker
 
 ## Project structure
 ```
-main.py             FastAPI app: auth, pipeline, Q&A, health check, static hosting
+static/ai.js        Gemini prompts via Firebase AI Logic (browser)
+deploy_free.sh      One-command free deploy (Firebase Hosting + Firestore + Auth + AI Logic)
+main.py             Cloud Run backend (FastAPI): auth, pipeline, Q&A, health check, static hosting
 gemini_service.py   All Gemini prompts and calls (model fallback)
 demo_data.py        Sample process notes used to seed the demo library
 setup_firebase.py   Automates Firebase setup (web app, rules, Auth, Storage link)
@@ -57,11 +54,11 @@ SETUP.md            Step-by-step deployment guide
 ```
 
 ## Deploy (one command)
-In Google Cloud Shell:
+Free (Firebase Spark plan, no billing account), in Google Cloud Shell:
 ```bash
-bash deploy.sh YOUR_PROJECT_ID
+bash deploy_free.sh YOUR_PROJECT_ID
 ```
-This sets up Firestore, Storage, Firebase (web app, security rules, sign-in), IAM and Cloud Run, then runs an end-to-end Gemini health check and loads demo SOPs. Full guide: [SETUP.md](SETUP.md).
+With billing enabled, the Cloud Run version: `bash deploy.sh YOUR_PROJECT_ID`. Full guide: [SETUP.md](SETUP.md).
 
 ## Run locally (after deploying once)
 ```bash
@@ -73,5 +70,5 @@ uvicorn main:app --reload --port 8080
 ```
 
 ## Links
-- **Live prototype:** _add Cloud Run URL_
-- **Demo video:** _add link_
+- **Live prototype:** https://ai-builder-512016.web.app (Firebase Hosting, free tier)
+- **Demo video:** _coming soon_

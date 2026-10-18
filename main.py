@@ -334,11 +334,18 @@ def _clean_training(t: dict, sop: dict) -> dict:
 
 # ------------------------------------------------------------------ static SPA
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+@app.get("/config.js", include_in_schema=False)
+def config_js():
+    from fastapi.responses import Response
+    import json
+    return Response(f"window.SOP_CONFIG = {json.dumps(config())};", media_type="application/javascript")
 
 
 @app.get("/{full_path:path}", include_in_schema=False)
 def spa(full_path: str):
     if full_path.startswith("api/"):
         return JSONResponse({"detail": "Not found"}, status_code=404)
+    f = (STATIC_DIR / full_path).resolve()
+    if full_path and f.is_file() and STATIC_DIR.resolve() in f.parents:
+        return FileResponse(f)
     return FileResponse(STATIC_DIR / "index.html")

@@ -3,24 +3,28 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     function signedIn() { return request.auth != null; }
+    function isOwner(data) { return signedIn() && data.ownerUid == request.auth.uid; }
 
-    // SOPs: any signed-in teammate can read; the creator can create a new one.
-    // All processing updates are written by the Cloud Run backend (Admin SDK bypasses rules).
+    // SOPs: every signed-in teammate can read the shared library.
+    // Only the creator can create, update (pipeline status / Gemini results) or delete their SOP.
     match /sops/{sopId} {
       allow read: if signedIn();
-      allow create: if signedIn()
-        && request.resource.data.ownerUid == request.auth.uid
+      allow create: if isOwner(request.resource.data)
         && request.resource.data.status == 'uploaded'
-        && request.resource.data.keys().hasOnly([
-             'ownerUid', 'ownerName', 'title', 'context', 'status', 'statusMessage',
-             'sourceType', 'videoPath', 'videoMime', 'notes', 'createdAt', 'updatedAt'])
-        && (request.resource.data.sourceType != 'video'
-            || request.resource.data.videoPath.matches('uploads/' + request.auth.uid + '/.*'));
-      allow update, delete: if false;
+        && request.resource.data.sourceType in ['notes', 'video'];
+      allow update: if isOwner(resource.data)
+        && request.resource.data.ownerUid == resource.data.ownerUid;
+      allow delete: if isOwner(resource.data);
 
+      // Ask-this-SOP history: anyone signed in can ask; answers are written by the asker's client.
       match /qa/{qaId} {
         allow read: if signedIn();
-        allow write: if false;
+        allow create: if signedIn()
+          && request.resource.data.askedByUid == request.auth.uid
+          && request.resource.data.question is string
+          && request.resource.data.question.size() <= 600;
+        allow delete: if signedIn()
+          && get(/databases/$(database)/documents/sops/$(sopId)).data.ownerUid == request.auth.uid;
       }
     }
 

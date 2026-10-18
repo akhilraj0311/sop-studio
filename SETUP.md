@@ -1,4 +1,14 @@
-# Deploy SOP Studio (about 15 minutes, one command)
+# Deploy SOP Studio
+
+## Option A: free (no billing account), about 5 minutes
+In Google Cloud Shell:
+```bash
+bash deploy_free.sh YOUR_PROJECT_ID
+```
+Then, once: Firebase console → **AI Logic → Get started → Gemini Developer API** (the script prints the link).
+Open `https://YOUR_PROJECT_ID.web.app` → **Try it as a guest** → **Load 3 demo SOPs**.
+
+## Option B: Cloud Run (needs billing), about 15 minutes
 
 Everything runs in **Google Cloud Shell**, a free browser terminal that's already logged in as you, with `gcloud` preinstalled.
 
